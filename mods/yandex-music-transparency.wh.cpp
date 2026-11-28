@@ -2,7 +2,7 @@
 // @id              yandex-music-transparency
 // @name            Yandex Music Transparency
 // @description     Automatically applies and enforces custom transparency for Yandex Music
-// @version         1.27
+// @version         1.2.9
 // @author          NIKTO
 // @github          https://github.com/NIKTO-2
 // @include         Яндекс Музыка.exe
@@ -10,72 +10,35 @@
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
-/*
-
-# Yandex Music Transparency
-
-Adds configurable transparency for the Yandex Music desktop application.
-
-## Features
-
-- Custom opacity for active and inactive windows
-- Optional full opacity while the mouse hovers over the window
-- Smooth animated transitions between opacity levels (can be disabled)
-- Automatically enforces transparency even if the app tries to remove `WS_EX_LAYERED`
-
-## Notes
-
-- Only the main application window (class `Chrome_WidgetWin_1`) is modified
-- Auxiliary Electron processes (`--type=*`) are ignored
-- Windows that already use `LWA_COLORKEY` are not modified
-
-*/
+/*...*/
 // ==/WindhawkModReadme==
 
 // ==WindhawkModChangelog==
 /*
-## 1.27
+## 1.2.9
 
-- Fixed transparency being broken: the function that applies the target alpha
-  now ensures `WS_EX_LAYERED` is set first (and skips `LWA_COLORKEY`
-  windows). Previously the layered style was never applied, so
-  `SetLayeredWindowAttributes` failed and the window stayed opaque.
-
-## 1.26
-
-- Removed the `PlaybackAlpha` feature (title-based playback detection) — it
-  could interfere with normal transparency. Smooth transitions remain.
-
-## 1.25
-
-- Added smooth animated transitions between opacity levels (toggleable).
-- Added `PlaybackAlpha` — when a track is playing (title-based detection), a
-  separate opacity value is used. `0` disables this feature.
-
-## 1.24
-
-- Removed all background blur effects (Blur / Acrylic / Mica). The mod now
-  only provides window transparency.
+- Added configurable opacity for active and inactive windows
+  (`Alpha` / `InactiveAlpha`).
+- Added "fully opaque on hover" option (`OpaqueOnHover`).
+- Added "fully opaque when maximized/fullscreen" option
+  (`OpaqueWhenMaximized`), applied immediately to avoid clashing with the
+  system resize animation.
+- Added smooth animated transitions between opacity levels
+  (`SmoothTransitions`).
+- Added idle fade: the window smoothly fades after a configurable period of
+  inactivity (`IdleFadeTimeout`, `IdleFadeAlpha`).
+- Added mouse wheel opacity: hold Ctrl and scroll over the window to adjust
+  transparency on the fly (`WheelOpacityEnabled`, `WheelOpacityStep`).
+- Defaults: active opacity 220, inactive opacity 170 (inactive windows are now
+  more transparent than the active value), smooth transitions on, fully
+  opaque on hover off.
+- Fixed restoring the original alpha on unload (the window's true original
+  opacity is now captured once).
 */
 // ==/WindhawkModChangelog==
 
 // ==WindhawkModSettings==
-/*
-
-- Alpha: 180
-  $name: Active window opacity
-  $description: Opacity level of the active window (50-255)
-- InactiveAlpha: 0
-  $name: Inactive window opacity
-  $description: Opacity level of the inactive window. Set to 0 to use the active alpha value (50-255)
-- OpaqueOnHover: false
-  $name: Fully opaque on hover
-  $description: Make the window fully opaque while the mouse hovers over it
-- SmoothTransitions: true
-  $name: Smooth transitions
-  $description: Animate opacity changes instead of applying them instantly.
-
-*/
+/*...*/
 // ==/WindhawkModSettings==
 
 #include <windhawk_utils.h>
@@ -90,7 +53,12 @@ struct Settings {
     int alpha;
     int inactiveAlpha;
     bool opaqueOnHover;
+    bool opaqueWhenMaximized;
     bool smoothTransitions;
+    int idleFadeTimeout;
+    int idleFadeAlpha;
+    bool wheelOpacityEnabled;
+    int wheelOpacityStep;
 };
 
 struct OriginalWindowState {
@@ -99,6 +67,8 @@ struct OriginalWindowState {
     bool hasOriginalAlpha;
     bool isActive;
     bool isHovered;
+    bool wasMaximized;
+    bool isIdle;
     BYTE currentAlpha;      // currently applied alpha (0 = not initialized)
     BYTE targetAlpha;       // desired alpha
     bool alphaInitialized;
@@ -110,9 +80,18 @@ std::unordered_map<HWND, OriginalWindowState> g_trackedWindows;
 bool g_unloading = false;
 
 constexpr UINT_PTR kHoverTimerId = 0x4D545248;  // 'MTRH'
-constexpr UINT kHoverTimerIntervalMs = 25;
-constexpr int kAnimStep = 10;  // alpha units per tick (25 ms)
-HWND g_timerOwner = nullptr;
+constexpr UINT kTimerIntervalFastMs = 25;      // animation tick
+constexpr UINT kTimerIntervalSlowMs = 100;     // hover polling
+constexpr int kAnimStep = 10;                  // alpha units per fast tick
+
+// Registered message used to ask the window's own thread to update its timer.
+UINT g_timerControlMsg = 0;
+
+// Global low-level mouse hook to catch the wheel even when it is handled by a
+// Chromium child window (Chrome_RenderWidgetHostHWND) instead of the main
+// window we subclass.
+HHOOK g_mouseHook = nullptr;
+UINT g_mouseHookControlMsg = 0;
 
 void LoadSettings() {
     g_settings.alpha = Wh_GetIntSetting(L"Alpha");
@@ -127,7 +106,22 @@ void LoadSettings() {
 
     g_settings.opaqueOnHover = Wh_GetIntSetting(L"OpaqueOnHover") != 0;
 
+    g_settings.opaqueWhenMaximized = Wh_GetIntSetting(L"OpaqueWhenMaximized") != 0;
+
     g_settings.smoothTransitions = Wh_GetIntSetting(L"SmoothTransitions") != 0;
+
+    g_settings.idleFadeTimeout = Wh_GetIntSetting(L"IdleFadeTimeout");
+    if (g_settings.idleFadeTimeout < 0) g_settings.idleFadeTimeout = 0;
+
+    g_settings.idleFadeAlpha = Wh_GetIntSetting(L"IdleFadeAlpha");
+    if (g_settings.idleFadeAlpha < 50) g_settings.idleFadeAlpha = 50;
+    if (g_settings.idleFadeAlpha > 255) g_settings.idleFadeAlpha = 255;
+
+    g_settings.wheelOpacityEnabled = Wh_GetIntSetting(L"WheelOpacityEnabled") != 0;
+
+    g_settings.wheelOpacityStep = Wh_GetIntSetting(L"WheelOpacityStep");
+    if (g_settings.wheelOpacityStep < 1) g_settings.wheelOpacityStep = 1;
+    if (g_settings.wheelOpacityStep > 50) g_settings.wheelOpacityStep = 50;
 }
 
 bool IsTargetWindow(HWND hwnd) {
@@ -155,7 +149,44 @@ bool UsesColorKey(HWND hwnd) {
     return false;
 }
 
-BYTE ComputeTargetAlpha(const OriginalWindowState& state) {
+// [alpha v1.2.9] Fully opaque when maximized: true when the window is
+// maximized or covers the full work area (fullscreen).
+bool IsMaximizedOrFullscreen(HWND hwnd) {
+    if (IsZoomed(hwnd)) {
+        return true;
+    }
+
+    RECT wndRect;
+    if (!GetWindowRect(hwnd, &wndRect)) {
+        return false;
+    }
+    if (wndRect.right - wndRect.left <= 0 || wndRect.bottom - wndRect.top <= 0) {
+        return false;
+    }
+
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!monitor) {
+        return false;
+    }
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(monitor, &mi)) {
+        return false;
+    }
+
+    return (wndRect.left <= mi.rcMonitor.left &&
+            wndRect.top <= mi.rcMonitor.top &&
+            wndRect.right >= mi.rcMonitor.right &&
+            wndRect.bottom >= mi.rcMonitor.bottom);
+}
+
+BYTE ComputeTargetAlpha(HWND hwnd, const OriginalWindowState& state) {
+    if (g_settings.idleFadeTimeout > 0 && state.isIdle) {
+        return (BYTE)g_settings.idleFadeAlpha;
+    }
+    if (g_settings.opaqueWhenMaximized && IsMaximizedOrFullscreen(hwnd)) {
+        return 255;
+    }
     if (g_settings.opaqueOnHover && state.isHovered) {
         return 255;
     }
@@ -182,7 +213,7 @@ BOOL WINAPI SetLayeredWindowAttributes_Hook(HWND hwnd, COLORREF crKey, BYTE bAlp
                     it->second.hasOriginalAlpha = true;
                 }
                 shouldReplace = true;
-                computedAlpha = ComputeTargetAlpha(it->second);
+                computedAlpha = ComputeTargetAlpha(hwnd, it->second);
             }
         }
         if (shouldReplace) {
@@ -190,6 +221,61 @@ BOOL WINAPI SetLayeredWindowAttributes_Hook(HWND hwnd, COLORREF crKey, BYTE bAlp
         }
     }
     return SetLayeredWindowAttributes_Original(hwnd, crKey, newAlpha, dwFlags);
+}
+
+void ApplyTargetAlpha(HWND hwnd);
+
+// Runs on the window's own thread: fast while animating, slow for hover
+// polling, otherwise stopped.
+void UpdateTimer(HWND hwnd) {
+    bool animating = false;
+    {
+        std::lock_guard<std::mutex> lock(g_windowsMutex);
+        auto it = g_trackedWindows.find(hwnd);
+        animating = it != g_trackedWindows.end() &&
+                    it->second.currentAlpha != it->second.targetAlpha;
+    }
+
+    if (g_unloading) {
+        KillTimer(hwnd, kHoverTimerId);
+    } else if (animating) {
+        SetTimer(hwnd, kHoverTimerId, kTimerIntervalFastMs, nullptr);
+    } else if (g_settings.opaqueOnHover || g_settings.idleFadeTimeout > 0) {
+        SetTimer(hwnd, kHoverTimerId, kTimerIntervalSlowMs, nullptr);
+    } else {
+        KillTimer(hwnd, kHoverTimerId);
+    }
+}
+
+// Updates the idle state for a single window. The window is considered idle
+// when there was no system input for IdleFadeTimeout seconds.
+void UpdateIdleState(HWND hwnd) {
+    if (g_settings.idleFadeTimeout <= 0) {
+        return;
+    }
+
+    LASTINPUTINFO lii{};
+    lii.cbSize = sizeof(lii);
+    if (!GetLastInputInfo(&lii)) {
+        return;
+    }
+
+    DWORD now = GetTickCount();
+    bool nowIdle = (now - lii.dwTime) >= (DWORD)g_settings.idleFadeTimeout * 1000;
+
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_windowsMutex);
+        auto it = g_trackedWindows.find(hwnd);
+        if (it != g_trackedWindows.end() && it->second.isIdle != nowIdle) {
+            it->second.isIdle = nowIdle;
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        ApplyTargetAlpha(hwnd);
+    }
 }
 
 // Applies the target alpha. When smooth transitions are enabled, the actual
@@ -206,78 +292,94 @@ void ApplyTargetAlpha(HWND hwnd) {
         SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
     }
 
-    std::lock_guard<std::mutex> lock(g_windowsMutex);
-    auto it = g_trackedWindows.find(hwnd);
-    if (it == g_trackedWindows.end()) return;
-
-    BYTE target = ComputeTargetAlpha(it->second);
-
-    if (!it->second.alphaInitialized || !g_settings.smoothTransitions) {
-        it->second.currentAlpha = target;
-        it->second.targetAlpha = target;
-        it->second.alphaInitialized = true;
-        SetLayeredWindowAttributes_Original(hwnd, 0, target, LWA_ALPHA);
-    } else {
-        it->second.targetAlpha = target;
-    }
-}
-
-// Advances the animated alpha toward the target for all tracked windows.
-void AnimateAllWindows() {
-    std::vector<HWND> toSet;
     {
         std::lock_guard<std::mutex> lock(g_windowsMutex);
-        for (auto& pair : g_trackedWindows) {
-            auto& st = pair.second;
-            if (!st.alphaInitialized) continue;
-            if (st.currentAlpha == st.targetAlpha) continue;
+        auto it = g_trackedWindows.find(hwnd);
+        if (it == g_trackedWindows.end()) return;
 
-            int delta = (int)st.targetAlpha - (int)st.currentAlpha;
-            int step = kAnimStep;
-            BYTE newAlpha;
-            if (delta > step) {
-                newAlpha = (BYTE)(st.currentAlpha + step);
-            } else if (delta < -step) {
-                newAlpha = (BYTE)(st.currentAlpha - step);
-            } else {
-                newAlpha = st.targetAlpha;
-            }
-            st.currentAlpha = newAlpha;
-            toSet.push_back(pair.first);
+        BYTE target = ComputeTargetAlpha(hwnd, it->second);
+
+        // [alpha v1.2.9] Fully opaque when maximized: apply immediately when
+        // transitioning into or out of the maximized / fullscreen state with
+        // OpaqueWhenMaximized on: animating simultaneously with the system
+        // resize animation looks like overlapping flicker.
+        bool isMaximized = (g_settings.opaqueWhenMaximized &&
+                            IsMaximizedOrFullscreen(hwnd));
+        bool maximizedStateChanged = (it->second.wasMaximized != isMaximized);
+        it->second.wasMaximized = isMaximized;
+
+        bool instant = maximizedStateChanged ||
+                       !it->second.alphaInitialized ||
+                       !g_settings.smoothTransitions;
+
+        if (instant) {
+            it->second.currentAlpha = target;
+            it->second.targetAlpha = target;
+            it->second.alphaInitialized = true;
+            SetLayeredWindowAttributes_Original(hwnd, 0, target, LWA_ALPHA);
+        } else {
+            it->second.targetAlpha = target;
         }
     }
 
-    for (HWND hwnd : toSet) {
-        BYTE alpha = 0;
-        {
-            std::lock_guard<std::mutex> lock(g_windowsMutex);
-            auto it = g_trackedWindows.find(hwnd);
-            if (it == g_trackedWindows.end()) continue;
-            alpha = it->second.currentAlpha;
+    // Always ask the window's own thread to update its timer (start/stop/interval).
+    // This makes hover polling work regardless of SmoothTransitions: UpdateTimer
+    // runs the slow timer while OpaqueOnHover is on, the fast one while
+    // animating, and kills it otherwise. Sent outside the mutex (UpdateTimer
+    // takes the mutex, so sending under the lock would deadlock).
+    SendMessageTimeoutW(hwnd, g_timerControlMsg, 0, 0,
+                        SMTO_ABORTIFHUNG, 200, nullptr);
+}
+
+// Advances the animated alpha one step for this window.
+void AnimateWindow(HWND hwnd) {
+    BYTE newAlpha = 0;
+    bool needSet = false;
+    {
+        std::lock_guard<std::mutex> lock(g_windowsMutex);
+        auto it = g_trackedWindows.find(hwnd);
+        if (it == g_trackedWindows.end()) return;
+        auto& st = it->second;
+        if (!st.alphaInitialized || st.currentAlpha == st.targetAlpha) return;
+
+        int delta = (int)st.targetAlpha - (int)st.currentAlpha;
+        int step = kAnimStep;
+        if (delta > step) {
+            newAlpha = (BYTE)(st.currentAlpha + step);
+        } else if (delta < -step) {
+            newAlpha = (BYTE)(st.currentAlpha - step);
+        } else {
+            newAlpha = st.targetAlpha;
         }
-        SetLayeredWindowAttributes_Original(hwnd, 0, alpha, LWA_ALPHA);
+        st.currentAlpha = newAlpha;
+        needSet = true;
+    }
+
+    if (needSet) {
+        SetLayeredWindowAttributes_Original(hwnd, 0, newAlpha, LWA_ALPHA);
     }
 }
 
-void UpdateHoverStateFromCursor() {
+// Updates the hover state for a single window.
+void UpdateHoverState(HWND hwnd) {
     POINT pt;
     if (!GetCursorPos(&pt)) return;
 
     HWND under = WindowFromPoint(pt);
     HWND topLevel = under ? GetAncestor(under, GA_ROOT) : nullptr;
+    bool nowHovered = (topLevel == hwnd);
 
-    std::vector<HWND> toApply;
+    bool changed = false;
     {
         std::lock_guard<std::mutex> lock(g_windowsMutex);
-        for (auto& pair : g_trackedWindows) {
-            bool nowHovered = (pair.first == topLevel);
-            if (pair.second.isHovered != nowHovered) {
-                pair.second.isHovered = nowHovered;
-                toApply.push_back(pair.first);
-            }
+        auto it = g_trackedWindows.find(hwnd);
+        if (it != g_trackedWindows.end() && it->second.isHovered != nowHovered) {
+            it->second.isHovered = nowHovered;
+            changed = true;
         }
     }
-    for (HWND hwnd : toApply) {
+
+    if (changed) {
         ApplyTargetAlpha(hwnd);
     }
 }
@@ -296,7 +398,74 @@ void RestoreWindow(HWND hwnd, const OriginalWindowState& state) {
     }
 }
 
+// Low-level mouse hook: catches the wheel anywhere in our window.
+LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0 && wParam == WM_MOUSEWHEEL) {
+        const auto* ms = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+        if (ms && g_settings.wheelOpacityEnabled && !g_unloading &&
+            (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
+            short delta = static_cast<short>(HIWORD(ms->mouseData));
+            if (delta != 0) {
+                HWND under = WindowFromPoint(ms->pt);
+                HWND topLevel = under ? GetAncestor(under, GA_ROOT) : nullptr;
+
+                bool tracked = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_windowsMutex);
+                    tracked = topLevel && g_trackedWindows.count(topLevel) != 0;
+                }
+
+                if (tracked) {
+                    int newAlpha = g_settings.alpha;
+                    int step = g_settings.wheelOpacityStep;
+                    newAlpha += (delta > 0) ? step : -step;
+                    if (newAlpha < 50) newAlpha = 50;
+                    if (newAlpha > 255) newAlpha = 255;
+                    if (newAlpha != g_settings.alpha) {
+                        Wh_Log(L"Wheel opacity: %d -> %d", g_settings.alpha, newAlpha);
+                        g_settings.alpha = newAlpha;
+                        ApplyTargetAlpha(topLevel);
+                    }
+                    return 1;
+                }
+            }
+        }
+    }
+    return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+}
+
 LRESULT CALLBACK WindowSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam, DWORD_PTR dwRefData) {
+    // Timer control message: handled on the window's own thread. UpdateTimer
+    // picks the interval from this window's state (no parameter needed).
+    if (uMsg == g_timerControlMsg) {
+        UpdateTimer(hwnd);
+        // Nonzero return so SendMessageTimeout can distinguish success.
+        return 1;
+    }
+
+    // Mouse hook control message: install/remove the low-level mouse hook on
+    // the window's own thread (it must run on a thread with a message loop).
+    if (uMsg == g_mouseHookControlMsg) {
+        if (wParam) {
+            if (!g_mouseHook) {
+                // The hook procedure lives in the current process, so hMod
+                // may be NULL for a global low-level hook.
+                g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc,
+                                                nullptr, 0);
+                if (!g_mouseHook) {
+                    Wh_Log(L"SetWindowsHookEx(WH_MOUSE_LL) failed, error %d",
+                           (int)GetLastError());
+                }
+            }
+        } else {
+            if (g_mouseHook) {
+                UnhookWindowsHookEx(g_mouseHook);
+                g_mouseHook = nullptr;
+            }
+        }
+        return 1;
+    }
+
     switch (uMsg) {
         case WM_STYLECHANGING: {
             if (!g_unloading && wParam == GWL_EXSTYLE) {
@@ -331,30 +500,30 @@ LRESULT CALLBACK WindowSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM 
             }
             break;
         }
+        case WM_WINDOWPOSCHANGED: {
+            if (!g_unloading && g_settings.opaqueWhenMaximized) {
+                ApplyTargetAlpha(hwnd);
+            }
+            break;
+        }
         case WM_TIMER: {
-            if (!g_unloading && wParam == kHoverTimerId && hwnd == g_timerOwner) {
-                UpdateHoverStateFromCursor();
-                AnimateAllWindows();
+            if (wParam == kHoverTimerId) {
+                if (!g_unloading) {
+                    if (g_settings.opaqueOnHover) {
+                        UpdateHoverState(hwnd);
+                    }
+                    UpdateIdleState(hwnd);
+                    AnimateWindow(hwnd);
+                }
+                UpdateTimer(hwnd);
                 return 0;
             }
             break;
         }
         case WM_NCDESTROY: {
-            HWND newOwner = nullptr;
             {
                 std::lock_guard<std::mutex> lock(g_windowsMutex);
                 g_trackedWindows.erase(hwnd);
-                if (g_timerOwner == hwnd) {
-                    g_timerOwner = nullptr;
-                    for (auto& pair : g_trackedWindows) {
-                        g_timerOwner = pair.first;
-                        newOwner = pair.first;
-                        break;
-                    }
-                }
-            }
-            if (newOwner && IsWindow(newOwner)) {
-                SetTimer(newOwner, kHoverTimerId, kHoverTimerIntervalMs, nullptr);
             }
             break;
         }
@@ -404,21 +573,15 @@ void AttachToWindow(HWND hwnd) {
         return;
     }
 
-    bool needTimer = false;
-    {
-        std::lock_guard<std::mutex> lock(g_windowsMutex);
-        if (!g_timerOwner) {
-            g_timerOwner = hwnd;
-            needTimer = true;
-        }
-    }
-    if (needTimer) {
-        if (!SetTimer(hwnd, kHoverTimerId, kHoverTimerIntervalMs, nullptr)) {
-            Wh_Log(L"SetTimer failed, error %d", (int)GetLastError());
-        }
-    }
-
+    // ApplyTargetAlpha schedules the timer update on the window's own thread,
+    // so no explicit timer management is needed here.
     ApplyTargetAlpha(hwnd);
+
+    // Install the low-level mouse hook on the window's thread if enabled.
+    if (g_settings.wheelOpacityEnabled) {
+        SendMessageTimeoutW(hwnd, g_mouseHookControlMsg, 1, 0,
+                            SMTO_ABORTIFHUNG, 200, nullptr);
+    }
 }
 
 using CreateWindowExW_t = decltype(&CreateWindowExW);
@@ -461,6 +624,18 @@ BOOL Wh_ModInit() {
         return FALSE;
     }
 
+    g_timerControlMsg = RegisterWindowMessageW(L"Windhawk_YandexMusicTransparency_TimerControl");
+    if (g_timerControlMsg == 0) {
+        Wh_Log(L"RegisterWindowMessage failed, error %d", (int)GetLastError());
+        return FALSE;
+    }
+
+    g_mouseHookControlMsg = RegisterWindowMessageW(L"Windhawk_YandexMusicTransparency_MouseHookControl");
+    if (g_mouseHookControlMsg == 0) {
+        Wh_Log(L"RegisterWindowMessage(mouse hook) failed, error %d", (int)GetLastError());
+        return FALSE;
+    }
+
     LoadSettings();
 
     if (!Wh_SetFunctionHook((void*)CreateWindowExW, (void*)CreateWindowExW_Hook, (void**)&CreateWindowExW_Original)) {
@@ -479,7 +654,18 @@ void Wh_ModAfterInit() {
 }
 
 void Wh_ModSettingsChanged() {
+    bool wheelWasEnabled = g_settings.wheelOpacityEnabled;
+
     LoadSettings();
+
+    // If the wheel feature was just turned off, restore the saved Alpha value
+    // (the wheel adjusts transparency only in memory).
+    if (wheelWasEnabled && !g_settings.wheelOpacityEnabled) {
+        int savedAlpha = Wh_GetIntSetting(L"Alpha");
+        if (savedAlpha < 50) savedAlpha = 50;
+        if (savedAlpha > 255) savedAlpha = 255;
+        g_settings.alpha = savedAlpha;
+    }
 
     std::vector<HWND> windows;
     {
@@ -490,29 +676,43 @@ void Wh_ModSettingsChanged() {
         }
     }
 
+    // ApplyTargetAlpha sends the timer-control message for each window, so
+    // hover polling / animation timers are (re)started or stopped as needed.
     for (HWND hwnd : windows) {
         ApplyTargetAlpha(hwnd);
+    }
+
+    // Sync the low-level mouse hook with the WheelOpacityEnabled setting.
+    UINT_PTR hookParam = g_settings.wheelOpacityEnabled ? 1 : 0;
+    for (HWND hwnd : windows) {
+        SendMessageTimeoutW(hwnd, g_mouseHookControlMsg, hookParam, 0,
+                            SMTO_ABORTIFHUNG, 200, nullptr);
     }
 }
 
 void Wh_ModUninit() {
     g_unloading = true;
 
-    HWND timerOwner = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_windowsMutex);
-        timerOwner = g_timerOwner;
-        g_timerOwner = nullptr;
-    }
-    if (timerOwner && IsWindow(timerOwner)) {
-        KillTimer(timerOwner, kHoverTimerId);
-    }
-
     std::vector<std::pair<HWND, OriginalWindowState>> windows;
     {
         std::lock_guard<std::mutex> lock(g_windowsMutex);
         windows.assign(g_trackedWindows.begin(), g_trackedWindows.end());
         g_trackedWindows.clear();
+    }
+
+    // Stop each window's timer and the mouse hook on its own thread
+    // (g_unloading is set, so UpdateTimer kills the timer) before removing the
+    // subclass.
+    for (const auto& entry : windows) {
+        SendMessageTimeoutW(entry.first, g_timerControlMsg, 0, 0,
+                            SMTO_ABORTIFHUNG, 200, nullptr);
+        SendMessageTimeoutW(entry.first, g_mouseHookControlMsg, 0, 0,
+                            SMTO_ABORTIFHUNG, 200, nullptr);
+    }
+
+    if (g_mouseHook) {
+        UnhookWindowsHookEx(g_mouseHook);
+        g_mouseHook = nullptr;
     }
 
     for (const auto& entry : windows) {
